@@ -3,27 +3,27 @@
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
 #include <WiFi.h>
-#include <Firebase_ESP_Client.h>
-
-// Provide the token generation process info.
-#include "addons/TokenHelper.h"
-
-// ==========================================
-//      USER CONFIGURATION (EDIT THIS!)
-// ==========================================
-
-// 1. Wi-Fi Credentials
-#define WIFI_SSID "YANGUTI"
-#define WIFI_PASSWORD "fadaekalual"
-
-// 2. Firebase Credentials
-// Get these from Project Settings > General > Web App
-#define API_KEY "AIzaSyBp81huxx0eq7glvtpeYcr6fJJQF1LMdRk"
-#define FIREBASE_PROJECT_ID "smartmedicinebox-3f2df" 
+#include <HTTPClient.h> // PENGGANTI FIREBASE
+#include <ArduinoJson.h> // WAJIB INSTALL: Library "ArduinoJson" by Benoit Blanchon
+#include "time.h"
+#include <vector>
 
 // ==========================================
-//      HARDWARE PIN DEFINITIONS
+//      KONFIGURASI USER
 // ==========================================
+#define WIFI_SSID "Gembong Center"
+#define WIFI_PASSWORD "Pawpatrol#321"
+
+// GANTI DENGAN IP VPS ANDA (ATAU IP LOKAL LAPTOP JIKA TESTING)
+// Contoh: "http://192.168.1.10:3000" atau "http://vps-anda.com:3000"
+String API_URL = "http://147.139.136.133:3000"; 
+
+// Konfigurasi Waktu (WIB = UTC+7)
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 25200; 
+const int   daylightOffset_sec = 0; 
+
+// Hardware Pins
 #define DHT_PIN 18      
 #define REED_PIN 5      
 #define LED_PIN 13      
@@ -31,157 +31,261 @@
 #define DHT_TYPE DHT11
 
 // ==========================================
-//      GLOBAL OBJECTS & VARIABLES
+//      GLOBAL OBJECTS
 // ==========================================
 DHT dht(DHT_PIN, DHT_TYPE);
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
-// Firebase Objects
-FirebaseData fbDO;
-FirebaseAuth auth;
-FirebaseConfig config;
-bool signupOK = false;
-
 // Timers
 unsigned long lastDHTRead = 0;
-const long intervalDHT = 2000; // Read sensor every 2s
-
+const long intervalDHT = 2000;
 unsigned long lastCloudUpload = 0;
-const long intervalCloud = 15000; // Send to cloud every 15s (Save bandwidth/quota)
+const long intervalCloud = 5000; // Upload tiap 5 detik jika ada perubahan
 
-// Global variables to hold current state
+// Schedule Timers
+unsigned long lastScheduleFetch = 0;
+const long intervalFetch = 15000; 
+
+// Status Variables
 float currentTemp = 0.0;
 String currentBoxStatus = "UNKNOWN";
-bool isAlarmActive = false;
+String lastSentStatus = "UNKNOWN";
+
+// --- ALARM LOGIC VARIABLES ---
+unsigned long doorOpenStartTime = 0; 
+const long alarmDelay = 5000;       
+
+// Schedule Logic
+std::vector<String> alarmSchedules; 
+bool isScheduleActive = false;       
+unsigned long scheduleStartTime = 0; 
+String lastTriggeredTime = "";       
+
+// ==========================================
+//      HELPER FUNCTIONS
+// ==========================================
+
+// 1. Ambil Jam Saat Ini (HH:MM)
+String getLocalTimeStr() {
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)) return "--:--";
+  char timeStringBuff[6]; 
+  strftime(timeStringBuff, sizeof(timeStringBuff), "%H:%M", &timeinfo);
+  return String(timeStringBuff);
+}
+
+// 2. Fetch Schedules (MENGGUNAKAN HTTP CLIENT)
+void fetchSchedules() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = API_URL + "/api/data";
+    
+    http.begin(url);
+    int httpResponseCode = http.GET();
+    
+    if (httpResponseCode == 200) {
+      String payload = http.getString();
+      
+      // Parsing JSON menggunakan ArduinoJson
+      // Kapasitas doc disesuaikan (1024 cukup untuk ~10 jadwal)
+      DynamicJsonDocument doc(2048); 
+      DeserializationError error = deserializeJson(doc, payload);
+
+      if (!error) {
+        alarmSchedules.clear();
+        JsonArray schedules = doc["schedules"];
+        
+        for (JsonObject s : schedules) {
+          String timeStr = s["time"].as<String>();
+          // Validasi sederhana
+          if (timeStr.length() == 5 && timeStr.indexOf(":") > 0) {
+             alarmSchedules.push_back(timeStr);
+             Serial.print(">> Jadwal Ditemukan: "); Serial.println(timeStr);
+          }
+        }
+      } else {
+        Serial.print("JSON Parse Error: "); Serial.println(error.c_str());
+      }
+    } else {
+      Serial.print("Error Fetching Data: "); Serial.println(httpResponseCode);
+    }
+    http.end();
+  }
+}
+
+// 3. Upload Status (MENGGUNAKAN HTTP CLIENT)
+void uploadStatus(float temp, String status, String timeStr) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = API_URL + "/api/sensor";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    
+    // Buat JSON String manual atau pakai library
+    String jsonPayload = "{\"temp\": " + String(temp, 1) + 
+                         ", \"status\": \"" + status + "\"" +
+                         ", \"last_update\": \"" + timeStr + "\"}";
+                         
+    int httpResponseCode = http.POST(jsonPayload);
+    
+    if (httpResponseCode > 0) {
+       lastCloudUpload = millis();
+       lastSentStatus = status;
+       Serial.println("Data sent to VPS successfully");
+    } else {
+       Serial.print("Error Sending Data: "); Serial.println(httpResponseCode);
+    }
+    http.end();
+  }
+}
 
 void setup() {
   Serial.begin(115200);
 
-  // 1. Init Hardware
+  // Init Hardware
   dht.begin();
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(REED_PIN, INPUT); 
   
+  digitalWrite(LED_PIN, LOW);
+  analogWrite(BUZZER_PIN, 0);
+
   Wire.begin(); 
   lcd.init();
   lcd.backlight();
 
-  // 2. Connect to Wi-Fi
-  lcd.setCursor(0, 0);
-  lcd.print("Connecting WiFi");
-  
+  // Connect Wi-Fi
+  lcd.setCursor(0, 0); lcd.print("WiFi Connecting");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(300);
+    Serial.print("."); delay(300);
   }
-  Serial.println();
-  Serial.print("Connected with IP: ");
-  Serial.println(WiFi.localIP());
-
-  lcd.setCursor(0, 1);
-  lcd.print("WiFi OK!");
-  delay(1000);
-
-  // 3. Connect to Firebase
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Setup Firebase..");
-
-  config.api_key = API_KEY;
   
-  // Sign up anonymously so we can write data without login
-  if (Firebase.signUp(&config, &auth, "", "")){
-    Serial.println("Firebase Sign-up OK");
-    signupOK = true;
-  } else {
-    Serial.printf("%s\n", config.signer.signupError.message.c_str());
+  // Sync Time
+  lcd.setCursor(0, 0); lcd.print("Sync Time...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  struct tm timeinfo;
+  while(!getLocalTime(&timeinfo)){ 
+    Serial.println("Menunggu NTP Server...");
+    delay(1000); 
   }
-
-  // Optimization settings
-  config.token_status_callback = tokenStatusCallback; 
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
+  Serial.println("Waktu Tersinkron!");
 
   lcd.clear();
+  
+  // Ambil jadwal awal
+  fetchSchedules();
 }
 
 void loop() {
-  // ==========================================
-  // 1. LOGIC: ALARM (Real-time)
-  // ==========================================
-  bool reedStatus = digitalRead(REED_PIN); 
+  // Update Jam
+  String currentTime = getLocalTimeStr();
   
-  // REED MODULE LOGIC: LOW = CLOSED (Magnet Near), HIGH = OPEN (Magnet Far)
-  if (reedStatus == LOW) { 
-    // CLOSED (SAFE) - Magnet menempel pada reed switch
+  // =======================================================
+  // 1. UPDATE JADWAL DARI VPS (Tiap 15 Detik)
+  // =======================================================
+  if (millis() - lastScheduleFetch >= intervalFetch) {
+    lastScheduleFetch = millis();
+    fetchSchedules();
+  }
+
+  // =======================================================
+  // 2. CEK APAKAH SEKARANG WAKTUNYA MINUM OBAT?
+  // =======================================================
+  if (currentTime != lastTriggeredTime) { 
+    for (String schedTime : alarmSchedules) {
+      if (currentTime == schedTime) {
+        isScheduleActive = true; 
+        scheduleStartTime = millis(); 
+        lastTriggeredTime = currentTime; 
+        
+        Serial.print("!!! WAKTU OBAT TIBA (");
+        Serial.print(schedTime);
+        Serial.println(") !!!");
+      }
+    }
+  }
+
+  // =======================================================
+  // 3. BACA STATUS KOTAK
+  // =======================================================
+  // NOTE: Logika Reed Switch mungkin perlu dibalik tergantung wiring (INPUT_PULLUP vs resistor eksternal)
+  // Kode asli Anda menggunakan digitalRead(REED_PIN) == LOW untuk CLOSED.
+  bool isPinHigh = digitalRead(REED_PIN); 
+  
+  if (isPinHigh == LOW) { // TERTUTUP 
+    currentBoxStatus = "CLOSED";
+  } else { // TERBUKA
+    currentBoxStatus = "OPEN";
+    if (isScheduleActive) {
+      isScheduleActive = false; 
+      Serial.println("Obat Diambil. Alarm Mati.");
+    }
+  }
+
+  // =======================================================
+  // 4. LOGIKA ALARM PINTAR
+  // =======================================================
+  bool buzzerOn = false;
+  String lcdMsg = "Status: " + currentBoxStatus;
+
+  // -- SKENARIO A: ALARM JADWAL --
+  if (isScheduleActive) {
+    long timePassed = millis() - scheduleStartTime;
+    if (timePassed > alarmDelay) {
+      buzzerOn = true;
+      lcdMsg = "WAKTUNYA OBAT!";
+    } else {
+      lcdMsg = "Siap-siap...";
+    }
+  } 
+  // -- SKENARIO B: KOTAK DIBUKA PAKSA --
+  else if (currentBoxStatus == "OPEN") {
+    if (doorOpenStartTime == 0) doorOpenStartTime = millis();
+    if (millis() - doorOpenStartTime > alarmDelay) {
+      buzzerOn = true;
+      lcdMsg = "BOX DIBUKA!";
+    }
+  } else {
+    doorOpenStartTime = 0;
+  }
+
+  // EKSEKUSI HARDWARE
+  if (buzzerOn) {
+    digitalWrite(LED_PIN, HIGH);
+    analogWrite(BUZZER_PIN, 150); 
+  } else {
     digitalWrite(LED_PIN, LOW);
     analogWrite(BUZZER_PIN, 0);
-    currentBoxStatus = "CLOSED";
-    isAlarmActive = false;
-  } else { 
-    // OPEN (WARNING) - Magnet jauh dari reed switch
-    digitalWrite(LED_PIN, HIGH);
-    analogWrite(BUZZER_PIN, 5); // Low volume
-    currentBoxStatus = "OPEN";
-    isAlarmActive = true;
   }
 
-  // Update LCD Status (Bottom Line)
-  lcd.setCursor(0, 1);
-  lcd.print("Status: ");
-  lcd.print(currentBoxStatus);
-  lcd.print("   "); // Spaces to clear old text
-
-  // ==========================================
-  // 2. LOGIC: SENSOR READING (Every 2s)
-  // ==========================================
+  // =======================================================
+  // 5. TAMPILAN LCD
+  // =======================================================
   if (millis() - lastDHTRead >= intervalDHT) {
     lastDHTRead = millis();
-    
     float t = dht.readTemperature();
-    if (!isnan(t)) {
-      currentTemp = t;
-      // Update LCD Temp (Top Line)
-      lcd.setCursor(0, 0);
-      lcd.print("Temp: ");
-      lcd.print(currentTemp, 1);
-      lcd.print(" C   ");
-    } else {
-      lcd.setCursor(0, 0);
-      lcd.print("Temp: Error     ");
-    }
+    if (!isnan(t)) currentTemp = t;
+
+    lcd.setCursor(0, 0);
+    lcd.print("T:"); lcd.print(currentTemp, 1); lcd.print("C ");
+    lcd.setCursor(11, 0); lcd.print(currentTime); 
+    
+    lcd.setCursor(0, 1);
+    lcd.print(lcdMsg);
+    lcd.print("     "); 
   }
 
-  // ==========================================
-  // 3. LOGIC: UPLOAD TO FIREBASE (Every 15s)
-  // ==========================================
-  if (Firebase.ready() && signupOK && (millis() - lastCloudUpload >= intervalCloud)) {
-    lastCloudUpload = millis();
-    
-    Serial.println("Updating Firestore...");
+  // =======================================================
+  // 6. UPLOAD KE VPS
+  // =======================================================
+  bool shouldUpload = false;
+  if (currentBoxStatus != lastSentStatus) shouldUpload = true;
+  else if (millis() - lastCloudUpload >= intervalCloud) shouldUpload = true;
 
-    FirebaseJson content;
-    // Kita set field yang ingin di-update
-    content.set("fields/temperature/doubleValue", currentTemp);
-    content.set("fields/status/stringValue", currentBoxStatus);
-
-    // --- PERUBAHAN UTAMA DISINI ---
-    // Alih-alih upload ke folder "sensor_logs" secara acak,
-    // Kita tembak ke file spesifik: "sensor_logs/device_1"
-    
-    // Path: projects/{project_id}/databases/(default)/documents/{collection_id}/{document_id}
-    String documentPath = "sensor_logs/device_1"; 
-
-    // Gunakan patchDocument untuk update/menimpa data
-    // Parameter terakhir adalah updateMask (kosongkan "" agar update semua field di content)
-    if (Firebase.Firestore.patchDocument(&fbDO, FIREBASE_PROJECT_ID, "", documentPath.c_str(), content.raw(), "")) {
-        Serial.println("Update Success! (Realtime)");
-    } else {
-        Serial.println("Update Failed");
-        Serial.println(fbDO.errorReason());
-    }
+  if (shouldUpload) {
+    uploadStatus(currentTemp, currentBoxStatus, currentTime);
   }
 }
