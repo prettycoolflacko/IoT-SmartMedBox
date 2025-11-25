@@ -3,8 +3,8 @@
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
 #include <WiFi.h>
-#include <HTTPClient.h> // PENGGANTI FIREBASE
-#include <ArduinoJson.h> // WAJIB INSTALL: Library "ArduinoJson" by Benoit Blanchon
+#include <HTTPClient.h> // Masih pakai HTTP biasa sesuai request
+#include <ArduinoJson.h>
 #include "time.h"
 #include <vector>
 
@@ -14,11 +14,9 @@
 #define WIFI_SSID "Gembong Center"
 #define WIFI_PASSWORD "Pawpatrol#321"
 
-// GANTI DENGAN IP VPS ANDA (ATAU IP LOKAL LAPTOP JIKA TESTING)
-// Contoh: "http://192.168.1.10:3000" atau "http://vps-anda.com:3000"
+// GANTI IP VPS ANDA (HTTP)
 String API_URL = "http://147.139.136.133:3000"; 
 
-// Konfigurasi Waktu (WIB = UTC+7)
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 25200; 
 const int   daylightOffset_sec = 0; 
@@ -30,42 +28,35 @@ const int   daylightOffset_sec = 0;
 #define BUZZER_PIN 25   
 #define DHT_TYPE DHT11
 
-// ==========================================
-//      GLOBAL OBJECTS
-// ==========================================
+// Global Objects
 DHT dht(DHT_PIN, DHT_TYPE);
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
-// Timers
+// Timers Global
 unsigned long lastDHTRead = 0;
-const long intervalDHT = 2000;
 unsigned long lastCloudUpload = 0;
-const long intervalCloud = 5000; // Upload tiap 5 detik jika ada perubahan
-
-// Schedule Timers
 unsigned long lastScheduleFetch = 0;
 const long intervalFetch = 15000; 
 
-// Status Variables
+// --- LOGIC VARIABLES ---
 float currentTemp = 0.0;
 String currentBoxStatus = "UNKNOWN";
 String lastSentStatus = "UNKNOWN";
-
-// --- ALARM LOGIC VARIABLES ---
-unsigned long doorOpenStartTime = 0; 
-const long alarmDelay = 5000;       
+String displayedTime = "--:--";
 
 // Schedule Logic
 std::vector<String> alarmSchedules; 
 bool isScheduleActive = false;       
-unsigned long scheduleStartTime = 0; 
+unsigned long scheduleTriggerMillis = 0; // Waktu saat jadwal dimulai
 String lastTriggeredTime = "";       
+
+// High Temp Logic
+unsigned long lastHighTempBeep = 0;       
 
 // ==========================================
 //      HELPER FUNCTIONS
 // ==========================================
 
-// 1. Ambil Jam Saat Ini (HH:MM)
 String getLocalTimeStr() {
   struct tm timeinfo;
   if(!getLocalTime(&timeinfo)) return "--:--";
@@ -74,218 +65,157 @@ String getLocalTimeStr() {
   return String(timeStringBuff);
 }
 
-// 2. Fetch Schedules (MENGGUNAKAN HTTP CLIENT)
 void fetchSchedules() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    String url = API_URL + "/api/data";
-    
-    http.begin(url);
-    int httpResponseCode = http.GET();
-    
-    if (httpResponseCode == 200) {
-      String payload = http.getString();
-      
-      // Parsing JSON menggunakan ArduinoJson
-      // Kapasitas doc disesuaikan (1024 cukup untuk ~10 jadwal)
+    http.begin(API_URL + "/api/data");
+    int code = http.GET();
+    if (code == 200) {
       DynamicJsonDocument doc(2048); 
-      DeserializationError error = deserializeJson(doc, payload);
-
-      if (!error) {
-        alarmSchedules.clear();
-        JsonArray schedules = doc["schedules"];
-        
-        for (JsonObject s : schedules) {
-          String timeStr = s["time"].as<String>();
-          // Validasi sederhana
-          if (timeStr.length() == 5 && timeStr.indexOf(":") > 0) {
-             alarmSchedules.push_back(timeStr);
-             Serial.print(">> Jadwal Ditemukan: "); Serial.println(timeStr);
-          }
-        }
-      } else {
-        Serial.print("JSON Parse Error: "); Serial.println(error.c_str());
+      deserializeJson(doc, http.getString());
+      alarmSchedules.clear();
+      JsonArray schedules = doc["schedules"];
+      for (JsonObject s : schedules) {
+        String t = s["time"].as<String>();
+        if (t.length() == 5) alarmSchedules.push_back(t);
       }
-    } else {
-      Serial.print("Error Fetching Data: "); Serial.println(httpResponseCode);
     }
     http.end();
   }
 }
 
-// 3. Upload Status (MENGGUNAKAN HTTP CLIENT)
 void uploadStatus(float temp, String status, String timeStr) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    String url = API_URL + "/api/sensor";
-    
-    http.begin(url);
+    http.begin(API_URL + "/api/sensor");
     http.addHeader("Content-Type", "application/json");
-    
-    // Buat JSON String manual atau pakai library
-    String jsonPayload = "{\"temp\": " + String(temp, 1) + 
-                         ", \"status\": \"" + status + "\"" +
-                         ", \"last_update\": \"" + timeStr + "\"}";
-                         
-    int httpResponseCode = http.POST(jsonPayload);
-    
-    if (httpResponseCode > 0) {
-       lastCloudUpload = millis();
-       lastSentStatus = status;
-       Serial.println("Data sent to VPS successfully");
-    } else {
-       Serial.print("Error Sending Data: "); Serial.println(httpResponseCode);
-    }
+    String payload = "{\"temp\": " + String(temp, 1) + 
+                     ", \"status\": \"" + status + "\"" +
+                     ", \"last_update\": \"" + timeStr + "\"}";
+    http.POST(payload);
     http.end();
+    lastCloudUpload = millis();
+    lastSentStatus = status;
   }
 }
 
 void setup() {
   Serial.begin(115200);
-
-  // Init Hardware
   dht.begin();
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(REED_PIN, INPUT); 
   
-  digitalWrite(LED_PIN, LOW);
-  analogWrite(BUZZER_PIN, 0);
+  Wire.begin(); lcd.init(); lcd.backlight();
 
-  Wire.begin(); 
-  lcd.init();
-  lcd.backlight();
-
-  // Connect Wi-Fi
-  lcd.setCursor(0, 0); lcd.print("WiFi Connecting");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print("."); delay(300);
-  }
+  lcd.setCursor(0,0); lcd.print("WiFi Connect...");
+  while (WiFi.status() != WL_CONNECTED) delay(500);
   
-  // Sync Time
-  lcd.setCursor(0, 0); lcd.print("Sync Time...");
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  struct tm timeinfo;
-  while(!getLocalTime(&timeinfo)){ 
-    Serial.println("Menunggu NTP Server...");
-    delay(1000); 
-  }
-  Serial.println("Waktu Tersinkron!");
-
-  lcd.clear();
-  
-  // Ambil jadwal awal
   fetchSchedules();
+  lcd.clear();
 }
 
 void loop() {
-  // Update Jam
   String currentTime = getLocalTimeStr();
+  unsigned long now = millis();
+
+  // 1. BACA SENSOR & STATUS PINTU
+  if (now - lastDHTRead > 2000) {
+    float t = dht.readTemperature();
+    if (!isnan(t)) currentTemp = t;
+    lastDHTRead = now;
+  }
   
-  // =======================================================
-  // 1. UPDATE JADWAL DARI VPS (Tiap 15 Detik)
-  // =======================================================
-  if (millis() - lastScheduleFetch >= intervalFetch) {
-    lastScheduleFetch = millis();
-    fetchSchedules();
+  // Logic Reed Switch (Low = Closed, High = Open)
+  bool isClosed = (digitalRead(REED_PIN) == LOW);
+  String detectedStatus = isClosed ? "CLOSED" : "OPEN";
+
+  // Jika pintu dibuka, reset jadwal & alarm
+  if (!isClosed) {
+      if (isScheduleActive) {
+          isScheduleActive = false;
+          Serial.println("Box Opened -> Alarm Reset");
+      }
+      // Matikan output fisik
+      digitalWrite(LED_PIN, LOW);
+      analogWrite(BUZZER_PIN, 0);
   }
 
-  // =======================================================
-  // 2. CEK APAKAH SEKARANG WAKTUNYA MINUM OBAT?
-  // =======================================================
-  if (currentTime != lastTriggeredTime) { 
-    for (String schedTime : alarmSchedules) {
-      if (currentTime == schedTime) {
-        isScheduleActive = true; 
-        scheduleStartTime = millis(); 
-        lastTriggeredTime = currentTime; 
-        
-        Serial.print("!!! WAKTU OBAT TIBA (");
-        Serial.print(schedTime);
-        Serial.println(") !!!");
+  // 2. CEK JADWAL (Hanya jika pintu tertutup)
+  if (isClosed && currentTime != lastTriggeredTime) {
+    for (String s : alarmSchedules) {
+      if (currentTime == s) {
+        isScheduleActive = true;
+        scheduleTriggerMillis = now; // Mulai stopwatch
+        lastTriggeredTime = currentTime;
+        Serial.println("ALARM STARTED!");
       }
     }
   }
 
-  // =======================================================
-  // 3. BACA STATUS KOTAK
-  // =======================================================
-  // NOTE: Logika Reed Switch mungkin perlu dibalik tergantung wiring (INPUT_PULLUP vs resistor eksternal)
-  // Kode asli Anda menggunakan digitalRead(REED_PIN) == LOW untuk CLOSED.
-  bool isPinHigh = digitalRead(REED_PIN); 
+  // 3. LOGIKA UTAMA (RULES 1-4)
+  bool buzzerState = false;
+  bool ledState = false;
   
-  if (isPinHigh == LOW) { // TERTUTUP 
-    currentBoxStatus = "CLOSED";
-  } else { // TERBUKA
-    currentBoxStatus = "OPEN";
-    if (isScheduleActive) {
-      isScheduleActive = false; 
-      Serial.println("Obat Diambil. Alarm Mati.");
-    }
+  // RULE 1: HIGH TEMP WARNING (> 40C)
+  // Logic: Kalau suhu > 40, override semua logic lain.
+  if (currentTemp > 40.0 && isClosed) {
+      // Bunyi setiap 5 detik
+      if (now - lastHighTempBeep >= 5000) {
+          // Bip pendek (200ms)
+          analogWrite(BUZZER_PIN, 200);
+          delay(200); 
+          analogWrite(BUZZER_PIN, 0);
+          lastHighTempBeep = now;
+      }
+      detectedStatus = "DANGER"; // Kirim status Bahaya ke App
+  }
+  else if (isScheduleActive && isClosed) {
+      // --- LOGIKA JADWAL BERJALAN ---
+      unsigned long elapsed = now - scheduleTriggerMillis;
+
+      // RULE 3: LED ON for 20 seconds
+      if (elapsed < 20000) {
+          ledState = true;
+      }
+
+      // RULE 4: Delay 15s, then Buzzer ON for 15s (Total 30s mark)
+      if (elapsed >= 15000 && elapsed < 30000) {
+          buzzerState = true;
+      }
+
+      // RULE 2: Warning if not opened in 20s
+      if (elapsed >= 20000) {
+          detectedStatus = "LATE"; // Status khusus agar App memunculkan Warning
+      }
+
+      // Matikan jadwal otomatis setelah 30 detik (agar tidak loop selamanya)
+      if (elapsed >= 30000) {
+          isScheduleActive = false;
+      }
   }
 
-  // =======================================================
-  // 4. LOGIKA ALARM PINTAR
-  // =======================================================
-  bool buzzerOn = false;
-  String lcdMsg = "Status: " + currentBoxStatus;
-
-  // -- SKENARIO A: ALARM JADWAL --
-  if (isScheduleActive) {
-    long timePassed = millis() - scheduleStartTime;
-    if (timePassed > alarmDelay) {
-      buzzerOn = true;
-      lcdMsg = "WAKTUNYA OBAT!";
-    } else {
-      lcdMsg = "Siap-siap...";
-    }
-  } 
-  // -- SKENARIO B: KOTAK DIBUKA PAKSA --
-  else if (currentBoxStatus == "OPEN") {
-    if (doorOpenStartTime == 0) doorOpenStartTime = millis();
-    if (millis() - doorOpenStartTime > alarmDelay) {
-      buzzerOn = true;
-      lcdMsg = "BOX DIBUKA!";
-    }
-  } else {
-    doorOpenStartTime = 0;
+  // 4. EKSEKUSI HARDWARE
+  // (Kecuali kondisi High Temp yang punya logic bip sendiri di atas)
+  if (currentTemp <= 40.0) {
+      digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+      analogWrite(BUZZER_PIN, buzzerState ? 150 : 0);
   }
 
-  // EKSEKUSI HARDWARE
-  if (buzzerOn) {
-    digitalWrite(LED_PIN, HIGH);
-    analogWrite(BUZZER_PIN, 150); 
-  } else {
-    digitalWrite(LED_PIN, LOW);
-    analogWrite(BUZZER_PIN, 0);
+  // 5. UPDATE SERVER
+  // Jika status berubah (misal dari CLOSED jadi LATE), kirim segera
+  if (detectedStatus != lastSentStatus || now - lastCloudUpload > 5000) {
+      uploadStatus(currentTemp, detectedStatus, currentTime);
+      // Agar tidak spam upload terus menerus saat status LATE
+      if (detectedStatus == "LATE" && lastSentStatus == "LATE") {
+          lastCloudUpload = now; 
+      }
   }
 
-  // =======================================================
-  // 5. TAMPILAN LCD
-  // =======================================================
-  if (millis() - lastDHTRead >= intervalDHT) {
-    lastDHTRead = millis();
-    float t = dht.readTemperature();
-    if (!isnan(t)) currentTemp = t;
-
-    lcd.setCursor(0, 0);
-    lcd.print("T:"); lcd.print(currentTemp, 1); lcd.print("C ");
-    lcd.setCursor(11, 0); lcd.print(currentTime); 
-    
-    lcd.setCursor(0, 1);
-    lcd.print(lcdMsg);
-    lcd.print("     "); 
-  }
-
-  // =======================================================
-  // 6. UPLOAD KE VPS
-  // =======================================================
-  bool shouldUpload = false;
-  if (currentBoxStatus != lastSentStatus) shouldUpload = true;
-  else if (millis() - lastCloudUpload >= intervalCloud) shouldUpload = true;
-
-  if (shouldUpload) {
-    uploadStatus(currentTemp, currentBoxStatus, currentTime);
-  }
+  // 6. LCD DISPLAY
+  lcd.setCursor(0, 0); lcd.print("T:"); lcd.print(currentTemp, 1); lcd.print("C ");
+  lcd.setCursor(11,0); lcd.print(currentTime);
+  lcd.setCursor(0, 1); lcd.print(detectedStatus); lcd.print("      ");
 }
