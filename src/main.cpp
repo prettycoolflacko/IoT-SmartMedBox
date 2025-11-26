@@ -10,15 +10,15 @@
 #include <WiFiManager.h> // NEW LIBRARY
 
 // ==========================================
-//      KONFIGURASI USER
+//      USER CONFIGURATION
 // ==========================================
 // NOTE: WIFI_SSID and PASSWORD are removed. 
 // They are now handled dynamically by WiFiManager.
 
-// GANTI DENGAN DOMAIN HTTPS ANDA
+// REPLACE WITH YOUR HTTPS DOMAIN
 String API_URL = "https://flacko.fyuko.dev"; 
   
-// Konfigurasi Waktu (WIB = UTC+7)
+// Time Configuration (WIB = UTC+7)
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 25200; 
 const int   daylightOffset_sec = 0; 
@@ -40,7 +40,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 unsigned long lastDHTRead = 0;
 const long intervalDHT = 2000;
 unsigned long lastCloudUpload = 0;
-const long intervalCloud = 5000; // Upload tiap 5 detik jika ada perubahan
+const long intervalCloud = 5000; // Upload every 5 seconds if there are changes
 
 // Schedule Timers
 unsigned long lastScheduleFetch = 0;
@@ -61,30 +61,29 @@ bool isScheduleActive = false;
 unsigned long scheduleStartTime = 0; 
 String lastTriggeredTime = "";
 
-// --- NEW LOGIC VARIABLES ---
-// Temperature alarm logic
-unsigned long lastTempBuzzerToggle = 0;
-bool tempBuzzerState = false;
-const long tempBuzzerInterval = 5000; // 5 seconds on/off interval
+// --- NEW LOGIC VARIABLES (Mr. P's Requirements) ---
+// Box Open Timing
+unsigned long boxOpenStartTime = 0;
+unsigned long lastBoxOpenBuzzerToggle = 0;
+bool boxOpenBuzzerState = false;
 
-// Schedule LED logic
-unsigned long scheduleLedStartTime = 0;
-bool scheduleLedActive = false;
-const long scheduleLedDuration = 20000; // 20 seconds
+// Schedule Grace Period (1 minute after schedule)
+bool scheduleGracePeriodActive = false;
+unsigned long scheduleGracePeriodStart = 0;
+const long scheduleGracePeriodDuration = 60000; // 1 minute
 
-// Schedule buzzer delay logic
-unsigned long scheduleBuzzerDelayStart = 0;
-unsigned long scheduleBuzzerStartTime = 0;
-bool scheduleBuzzerDelayActive = false;
-bool scheduleBuzzerActive = false;
-const long scheduleBuzzerDelay = 15000; // 15 seconds delay
-const long scheduleBuzzerDuration = 15000; // 15 seconds buzzer       
+// Delays for LED and Buzzer
+const long ledDelayAfterSchedule = 5000;    // 5 seconds
+const long buzzerDelayAfterSchedule = 10000; // 10 seconds
+const long ledDelayBoxOpen = 5000;           // 5 seconds
+const long buzzerDelayBoxOpen = 10000;       // 10 seconds
+const long buzzerToggleInterval = 5000;      // 5 seconds ON/OFF       
 
 // ==========================================
 //      HELPER FUNCTIONS
 // ==========================================
 
-// 1. Ambil Jam Saat Ini (HH:MM)
+// 1. Get Current Time (HH:MM)
 String getLocalTimeStr() {
   struct tm timeinfo;
   if(!getLocalTime(&timeinfo)) return "--:--";
@@ -93,7 +92,7 @@ String getLocalTimeStr() {
   return String(timeStringBuff);
 }
 
-// 2. Fetch Schedules (MENGGUNAKAN HTTP CLIENT)
+// 2. Fetch Schedules (USING HTTP CLIENT)
 void fetchSchedules() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
@@ -108,8 +107,8 @@ void fetchSchedules() {
     if (httpResponseCode == 200) {
       String payload = http.getString();
       
-      // Parsing JSON menggunakan ArduinoJson
-      // Kapasitas doc disesuaikan (1024 cukup untuk ~10 jadwal)
+      // Parsing JSON using ArduinoJson
+      // Doc capacity adjusted (1024 is enough for ~10 schedules)
       DynamicJsonDocument doc(2048); 
       DeserializationError error = deserializeJson(doc, payload);
 
@@ -119,10 +118,10 @@ void fetchSchedules() {
         
         for (JsonObject s : schedules) {
           String timeStr = s["time"].as<String>();
-          // Validasi sederhana
+          // Simple validation
           if (timeStr.length() == 5 && timeStr.indexOf(":") > 0) {
              alarmSchedules.push_back(timeStr);
-             Serial.print(">> Jadwal Ditemukan: "); Serial.println(timeStr);
+             Serial.print(">> Schedule Found: "); Serial.println(timeStr);
           }
         }
       } else {
@@ -135,7 +134,7 @@ void fetchSchedules() {
   }
 }
 
-// 3. Upload Status (MENGGUNAKAN HTTP CLIENT)
+// 3. Upload Status (USING HTTP CLIENT)
 void uploadStatus(float temp, String status, String timeStr) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
@@ -145,7 +144,7 @@ void uploadStatus(float temp, String status, String timeStr) {
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
     
-    // Buat JSON String manual atau pakai library
+    // Create JSON String manually or use library
     String jsonPayload = "{\"temp\": " + String(temp, 1) + 
                          ", \"status\": \"" + status + "\"" +
                          ", \"last_update\": \"" + timeStr + "\"}";
@@ -213,23 +212,23 @@ void setup() {
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   struct tm timeinfo;
   while(!getLocalTime(&timeinfo)){ 
-    Serial.println("Menunggu NTP Server...");
+    Serial.println("Waiting for NTP Server...");
     delay(1000); 
   }
-  Serial.println("Waktu Tersinkron!");
+  Serial.println("Time Synchronized!");
 
   lcd.clear();
   
-  // Ambil jadwal awal
+  // Fetch initial schedules
   fetchSchedules();
 }
 
 void loop() {
-  // Update Jam
+  // Update Time
   String currentTime = getLocalTimeStr();
   
   // =======================================================
-  // 1. UPDATE JADWAL DARI VPS (Tiap 15 Detik)
+  // 1. UPDATE SCHEDULE FROM VPS (Every 15 Seconds)
   // =======================================================
   if (millis() - lastScheduleFetch >= intervalFetch) {
     lastScheduleFetch = millis();
@@ -237,7 +236,7 @@ void loop() {
   }
 
   // =======================================================
-  // 2. CEK APAKAH SEKARANG WAKTUNYA MINUM OBAT?
+  // 2. CHECK IF IT'S TIME TO TAKE MEDICINE?
   // =======================================================
   if (currentTime != lastTriggeredTime) { 
     for (String schedTime : alarmSchedules) {
@@ -246,143 +245,131 @@ void loop() {
         scheduleStartTime = millis(); 
         lastTriggeredTime = currentTime; 
         
-        // NEW LOGIC: Activate LED for 20 seconds
-        scheduleLedActive = true;
-        scheduleLedStartTime = millis();
+        // Start 1-minute grace period
+        scheduleGracePeriodActive = true;
+        scheduleGracePeriodStart = millis();
         
-        // NEW LOGIC: Start 15 second delay before buzzer
-        scheduleBuzzerDelayActive = true;
-        scheduleBuzzerDelayStart = millis();
-        scheduleBuzzerActive = false;
-        
-        Serial.print("!!! WAKTU OBAT TIBA (");
+        Serial.print("!!! MEDICINE TIME ARRIVED (");
         Serial.print(schedTime);
         Serial.println(") !!!");
+        Serial.println("Grace period started - box open logic disabled for 1 minute");
       }
     }
   }
+  
+  // Check if grace period has ended
+  if (scheduleGracePeriodActive) {
+    if (millis() - scheduleGracePeriodStart >= scheduleGracePeriodDuration) {
+      scheduleGracePeriodActive = false;
+      Serial.println("Grace period ended - box open logic re-enabled");
+    }
+  }
 
   // =======================================================
-  // 3. BACA STATUS KOTAK
+  // 3. READ BOX STATUS
   // =======================================================
-  // NOTE: Logika Reed Switch mungkin perlu dibalik tergantung wiring (INPUT_PULLUP vs resistor eksternal)
-  // Kode asli Anda menggunakan digitalRead(REED_PIN) == LOW untuk CLOSED.
+  // NOTE: Reed Switch logic may need to be reversed depending on wiring (INPUT_PULLUP vs external resistor)
+  // Original code uses digitalRead(REED_PIN) == LOW for CLOSED.
   bool isPinHigh = digitalRead(REED_PIN); 
   
-  if (isPinHigh == LOW) { // TERTUTUP 
+  if (isPinHigh == LOW) { // CLOSED 
     currentBoxStatus = "CLOSED";
-  } else { // TERBUKA
+    boxOpenStartTime = 0; // Reset timer when box is closed
+    boxOpenBuzzerState = false; // Reset buzzer toggle state
+  } else { // OPEN
     currentBoxStatus = "OPEN";
-    if (isScheduleActive) {
-      isScheduleActive = false; 
-      Serial.println("Obat Diambil. Alarm Mati.");
+    
+    // Start tracking how long box has been open
+    if (boxOpenStartTime == 0) {
+      boxOpenStartTime = millis();
     }
     
-    // NEW LOGIC: Turn off temperature alarm when box is opened
-    tempBuzzerState = false;
-    lastTempBuzzerToggle = millis();
-  }
-
-  // =======================================================
-  // 4. NEW LOGIC: TEMPERATURE ALARM (Above 40°C)
-  // =======================================================
-  bool tempBuzzerOn = false;
-  if (currentTemp > 40.0 && currentBoxStatus == "CLOSED") {
-    // Toggle buzzer every 5 seconds
-    if (millis() - lastTempBuzzerToggle >= tempBuzzerInterval) {
-      tempBuzzerState = !tempBuzzerState;
-      lastTempBuzzerToggle = millis();
-    }
-    tempBuzzerOn = tempBuzzerState;
-  }
-
-  // =======================================================
-  // 5. NEW LOGIC: SCHEDULE LED (20 seconds)
-  // =======================================================
-  bool scheduleLedOn = false;
-  if (scheduleLedActive) {
-    if (millis() - scheduleLedStartTime >= scheduleLedDuration) {
-      scheduleLedActive = false;
-    } else {
-      scheduleLedOn = true;
+    if (isScheduleActive) {
+      isScheduleActive = false; 
+      scheduleGracePeriodActive = false; // End grace period when box opened
+      Serial.println("Medicine Taken. Alarm Off.");
     }
   }
 
   // =======================================================
-  // 6. NEW LOGIC: SCHEDULE BUZZER (15s delay + 15s on)
+  // 4. LED LOGIC (Mr. P's Requirements)
   // =======================================================
-  bool scheduleBuzzerOn = false;
-  if (scheduleBuzzerDelayActive) {
-    if (millis() - scheduleBuzzerDelayStart >= scheduleBuzzerDelay) {
-      scheduleBuzzerDelayActive = false;
-      scheduleBuzzerActive = true;
-      scheduleBuzzerStartTime = millis();
+  bool ledOn = false;
+  String lcdMsg = "Status: " + currentBoxStatus;
+  
+  // LED Case 1: Box opened for more than 5 seconds (but NOT during grace period)
+  if (currentBoxStatus == "OPEN" && !scheduleGracePeriodActive) {
+    if (boxOpenStartTime > 0 && (millis() - boxOpenStartTime >= ledDelayBoxOpen)) {
+      ledOn = true;
+      lcdMsg = "BOX OPENED!";
     }
   }
   
-  if (scheduleBuzzerActive) {
-    if (millis() - scheduleBuzzerStartTime >= scheduleBuzzerDuration) {
-      scheduleBuzzerActive = false;
-    } else {
-      scheduleBuzzerOn = true;
-    }
+  // LED Case 2: Temperature > 40°C and box is closed
+  if (currentTemp > 40.0 && currentBoxStatus == "CLOSED") {
+    ledOn = true;
+    lcdMsg = "HIGH TEMP!";
   }
-
-  // =======================================================
-  // 7. LOGIKA ALARM PINTAR (OLD LOGIC)
-  // =======================================================
-  bool buzzerOn = false;
-  String lcdMsg = "Status: " + currentBoxStatus;
-
-  // -- SKENARIO A: ALARM JADWAL --
+  
+  // LED Case 3: Schedule arrived, 5 seconds passed, box not opened
   if (isScheduleActive) {
     long timePassed = millis() - scheduleStartTime;
-    if (timePassed > alarmDelay) {
-      buzzerOn = true;
-      lcdMsg = "WAKTUNYA OBAT!";
+    if (timePassed >= ledDelayAfterSchedule) {
+      ledOn = true;
+      lcdMsg = "MEDICINE TIME!";
     } else {
-      lcdMsg = "Siap-siap...";
+      lcdMsg = "Get ready...";
     }
-  } 
-  // -- SKENARIO B: KOTAK DIBUKA PAKSA --
-  else if (currentBoxStatus == "OPEN") {
-    if (doorOpenStartTime == 0) doorOpenStartTime = millis();
-    if (millis() - doorOpenStartTime > alarmDelay) {
-      buzzerOn = true;
-      lcdMsg = "BOX DIBUKA!";
-    }
-  } else {
-    doorOpenStartTime = 0;
   }
 
   // =======================================================
-  // 8. EKSEKUSI HARDWARE (Combined Old + New Logic)
+  // 5. BUZZER LOGIC (Mr. P's Requirements)
   // =======================================================
-  // Combine all buzzer conditions (old logic OR new logic)
-  bool finalBuzzerOn = buzzerOn || tempBuzzerOn || scheduleBuzzerOn;
+  bool buzzerOn = false;
   
-  // Combine all LED conditions (old logic OR new schedule LED)
-  bool finalLedOn = buzzerOn || scheduleLedOn;
-  
-  if (finalBuzzerOn) {
-    analogWrite(BUZZER_PIN, 150); 
-  } else {
-    analogWrite(BUZZER_PIN, 0);
+  // Buzzer Case 1: Box opened for more than 10 seconds, toggle every 5s (but NOT during grace period)
+  if (currentBoxStatus == "OPEN" && !scheduleGracePeriodActive) {
+    if (boxOpenStartTime > 0 && (millis() - boxOpenStartTime >= buzzerDelayBoxOpen)) {
+      // Toggle buzzer every 5 seconds
+      if (millis() - lastBoxOpenBuzzerToggle >= buzzerToggleInterval) {
+        boxOpenBuzzerState = !boxOpenBuzzerState;
+        lastBoxOpenBuzzerToggle = millis();
+      }
+      buzzerOn = boxOpenBuzzerState;
+    }
   }
   
-  if (finalLedOn) {
+  // Buzzer Case 2: Temperature > 40°C and box is closed
+  // Turns OFF when: box opens OR temperature drops below 40°C
+  if (currentTemp > 40.0 && currentBoxStatus == "CLOSED") {
+    buzzerOn = true;
+  }
+  
+  // Buzzer Case 3: Schedule arrived, 10 seconds passed, box not opened
+  if (isScheduleActive) {
+    long timePassed = millis() - scheduleStartTime;
+    if (timePassed >= buzzerDelayAfterSchedule) {
+      buzzerOn = true;
+    }
+  }
+
+  // =======================================================
+  // 6. HARDWARE EXECUTION
+  // =======================================================
+  if (ledOn) {
     digitalWrite(LED_PIN, HIGH);
   } else {
     digitalWrite(LED_PIN, LOW);
   }
   
-  // Update LCD message for high temperature
-  if (currentTemp > 40.0 && currentBoxStatus == "CLOSED") {
-    lcdMsg = "HIGH TEMP!";
+  if (buzzerOn) {
+    analogWrite(BUZZER_PIN, 150); 
+  } else {
+    analogWrite(BUZZER_PIN, 0);
   }
 
   // =======================================================
-  // 9. TAMPILAN LCD
+  // 7. LCD DISPLAY (Updates every 2 seconds with temperature)
   // =======================================================
   if (millis() - lastDHTRead >= intervalDHT) {
     lastDHTRead = millis();
@@ -399,7 +386,7 @@ void loop() {
   }
 
   // =======================================================
-  // 10. UPLOAD KE VPS
+  // 8. UPLOAD TO VPS
   // =======================================================
   bool shouldUpload = false;
   if (currentBoxStatus != lastSentStatus) shouldUpload = true;
