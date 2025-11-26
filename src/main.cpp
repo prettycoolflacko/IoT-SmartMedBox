@@ -7,16 +7,16 @@
 #include <ArduinoJson.h> // WAJIB INSTALL: Library "ArduinoJson" by Benoit Blanchon
 #include "time.h"
 #include <vector>
+#include <WiFiManager.h> // NEW LIBRARY
 
 // ==========================================
 //      KONFIGURASI USER
 // ==========================================
-#define WIFI_SSID "Gembong Center"
-#define WIFI_PASSWORD "Pawpatrol#321"
+// NOTE: WIFI_SSID and PASSWORD are removed. 
+// They are now handled dynamically by WiFiManager.
 
-// GANTI DENGAN IP VPS ANDA (ATAU IP LOKAL LAPTOP JIKA TESTING)
-// Contoh: "http://192.168.1.10:3000" atau "http://vps-anda.com:3000"
-String API_URL = "http://147.139.136.133:3000"; 
+// GANTI DENGAN DOMAIN HTTPS ANDA
+String API_URL = "https://flacko.fyuko.dev"; 
   
 // Konfigurasi Waktu (WIB = UTC+7)
 const char* ntpServer = "pool.ntp.org";
@@ -99,7 +99,10 @@ void fetchSchedules() {
     HTTPClient http;
     String url = API_URL + "/api/data";
     
+    // Add User-Agent to prevent 403 errors on some servers
+    http.setUserAgent("ESP32");
     http.begin(url);
+    
     int httpResponseCode = http.GET();
     
     if (httpResponseCode == 200) {
@@ -138,6 +141,7 @@ void uploadStatus(float temp, String status, String timeStr) {
     HTTPClient http;
     String url = API_URL + "/api/sensor";
     
+    http.setUserAgent("ESP32");
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
     
@@ -175,14 +179,36 @@ void setup() {
   lcd.init();
   lcd.backlight();    
 
-  // Connect Wi-Fi
-  lcd.setCursor(0, 0); lcd.print("WiFi Connecting");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print("."); delay(300);
-  }
+  // ==========================================
+  // WIFI MANAGER SETUP
+  // ==========================================
+  WiFiManager wm;
   
+  // Uncomment line below if you want to erase saved wifi for testing
+  // wm.resetSettings(); 
+
+  lcd.setCursor(0, 0); 
+  lcd.print("WiFi Setup Mode");
+  lcd.setCursor(0, 1);
+  lcd.print("Connect to AP");
+
+  // This creates an Access Point named "SmartMedicine-Setup"
+  // If connection fails, it pauses here until you connect via phone
+  bool res = wm.autoConnect("SmartMedicine-Setup"); 
+
+  if(!res) {
+      Serial.println("Failed to connect");
+      // ESP.restart();
+  } else {
+      Serial.println("connected...yeey :)");
+      lcd.clear();
+      lcd.setCursor(0, 0); 
+      lcd.print("WiFi Connected!");
+      delay(2000);
+  }
+
   // Sync Time
+  lcd.clear();
   lcd.setCursor(0, 0); lcd.print("Sync Time...");
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   struct tm timeinfo;
